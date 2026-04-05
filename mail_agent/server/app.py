@@ -27,20 +27,38 @@ Usage:
     # Or run directly:
     python -m server.app
 """
+import sys
+import os
+import argparse
+import uvicorn
 
+# --- PATH BRIDGE ---
+current_dir = os.path.dirname(os.path.abspath(__file__))
+mail_agent_dir = os.path.dirname(current_dir)
+
+if mail_agent_dir not in sys.path:
+    sys.path.insert(0, mail_agent_dir)
+if current_dir not in sys.path:
+    sys.path.insert(0, current_dir)
+
+# --- IMPORTS ---
 try:
     from openenv.core.env_server.http_server import create_app
-except Exception as e:  # pragma: no cover
-    raise ImportError(
-        "openenv is required for the web interface. Install dependencies with '\n    uv sync\n'"
-    ) from e
+    from mail_agent_environment import MailAgentEnvironment
+    from models import EmailAction, EmailObservation
+    
+    # Map the Meta template names to your actual model names
+    MailAgentAction = EmailAction
+    MailAgentObservation = EmailObservation
 
-try:
-    from ..models import MailAgentAction, MailAgentObservation
-    from .mail_agent_environment import MailAgentEnvironment
-except ModuleNotFoundError:
-    from models import MailAgentAction, MailAgentObservation
-    from server.mail_agent_environment import MailAgentEnvironment
+except ImportError as e:
+    # If openenv is installed but the core imports fail, we handle it here
+    if "openenv" in str(e):
+        raise ImportError(
+            "openenv is required for the web interface. Install dependencies with '\n    uv sync\n'"
+        ) from e
+    print(f"❌ Still an issue: {e}")
+    sys.exit(1)
 
 
 # Create the app with web interface and README integration
