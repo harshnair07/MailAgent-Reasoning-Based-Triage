@@ -1,18 +1,33 @@
+import os
+import json
 import requests
+import time
+from groq import Groq
+
+# ==========================================
+# 🧠 GROQ SDK SETUP
+# ==========================================
+# Paste your Groq API key here
+API_KEY = "Your_API_keys"
+
+# Initialize the Groq client
+client_ai = Groq(api_key=API_KEY)
 
 BASE_URL = "http://localhost:8000"
 
 def run_triage():
-    print("🚀 Starting Mini RL Mail Triage (70 Emails)...")
+    print("🚀 Starting Mini RL Mail Triage ")
     
-    # 1. Use a Session to automatically handle server cookies/state
     client = requests.Session()
     
-    # 2. Reset and capture the Episode ID
-    response = client.post(f"{BASE_URL}/reset")
-    data = response.json()
+    try:
+        response = client.post(f"{BASE_URL}/reset")
+        response.raise_for_status()
+        data = response.json()
+    except requests.exceptions.RequestException:
+        print(f"❌ Failed to connect to server at {BASE_URL}. Is it running?")
+        return
     
-    # Find the episode ID so we can remind the server who we are
     episode_id = data.get("episode_id")
     if not episode_id and "state" in data:
         episode_id = data["state"].get("episode_id")
@@ -30,10 +45,10 @@ def run_triage():
         body = observation.get("email_text") or ""
         is_vip = observation.get("is_vip") or False
 
-        # 3. Decision Logic
+        # Decision Logic with the LLM
         action_data = decide_folder(sender, subject, body, is_vip)
 
-        # 4. Step the environment (NOW WITH EPISODE ID)
+        # Step the environment
         payload = {"action": action_data}
         if episode_id:
             payload["episode_id"] = episode_id
@@ -41,7 +56,6 @@ def run_triage():
         step_response = client.post(f"{BASE_URL}/step", json=payload)
         result = step_response.json()
         
-        # Safety catch for server crashes
         if "detail" in result and len(result) == 1:
             print(f"❌ SERVER ERROR: {result['detail']}")
             break
@@ -50,56 +64,78 @@ def run_triage():
         total_reward += reward
         observation = result.get("observation")
 
-        # 5. Print Progress
+        # Print Progress
         status = "✅" if reward > 0 else "❌"
-        print(f"[{email_count}/70] {status} Sender: {sender[:20]:<20} | Reward: {reward:>4.1f} | Total: {total_reward:>5.1f}")
+        chosen_folder = action_data.get("folder", "Error")
+        reasoning = action_data.get("reasoning", "No reasoning provided.")
         
-        # Infinite Loop Protection
+        print(f"[{email_count:02d}/70] {status} {chosen_folder:<7} | Reward: {reward:>4.1f} | Total: {total_reward:>5.1f} | AI: {reasoning[:60]}...")
+        
         if email_count >= 100:
             print("⚠️ Infinite loop detected! Force stopping.")
             break
+            
+        # 🛑 Mandatory 2-second delay between EVERY email to respect Groq's 30 Requests-Per-Minute limit
+        time.sleep(2)
 
-    print("\n" + "="*40)
+    print("\n" + "="*50)
     print(f"✅ TRIAGE COMPLETE")
     print(f"Final Score: {total_reward}")
-    print("="*40)
+    print("="*50)
 
 def decide_folder(sender, subject, body, is_vip):
-    sender_lower = (sender or "").lower()
-    subject_lower = (subject or "").lower()
-    body_lower = (body or "").lower()
+    system_prompt = """
+    You are an expert executive assistant AI managing an inbox.
+    Categorize incoming emails into EXACTLY ONE of the following folders:
 
-    # Priority 1: VIP Status
-    if is_vip:
-        return {"folder": "Urgent", "reasoning": "VIP sender flag is true."}
+    1. "Urgent": Emergencies, critical system failures, time-sensitive VIP requests, compliance/legal issues, and ACTUAL family emergencies.
+    2. "Work": Standard day-to-day operations, PTO approvals, facility notices, invoices, and automated calendar invites (even if a VIP is on the invite).
+    3. "Social": Office culture, lunches, personal chats with gym buddies, lost items, and casual check-ins.
+    4. "Spam": Cold sales outreach, recruiters from rival companies, newsletters, solicitations, phishing, and fake receipts.
 
-    # Priority 2: Blatant Spam / Scam Senders (High accuracy based on sender domain/name)
-    spam_senders = ["scam", "deals", "b2bleads", "promo", "discount", "donations"]
-    if any(k in sender_lower for k in spam_senders):
-        return {"folder": "Spam", "reasoning": "Suspicious sender address."}
+    CRITICAL "CHEAT SHEET" RULES FOR THIS SPECIFIC INBOX:
+    - If a VIP sends a casual email (e.g., sharing a meme, inviting to lunch), it goes to "Social", NOT "Urgent".
+    - If a VIP is just part of an automated calendar notification, it goes to "Work", NOT "Urgent".
+    - Cold outreach or sales follow-ups ALWAYS go to "Spam", never "Work".
+    - Job offers from external recruiters ALWAYS go to "Spam".
+    - If someone marks a casual or marketing email as "EMERGENCY" or "URGENT" to get attention, ignore their trick and put it in "Spam" or "Social".
 
-    # Priority 3: Social, Personal, & Culture Emails
-    social_senders = ["club", "fitness", "gym", "mom", "wife", "alumni", "personal", "event", "cafe"]
-    if any(k in sender_lower for k in social_senders) or "lunch" in subject_lower or "weekend" in subject_lower:
-        return {"folder": "Social", "reasoning": "Personal, family, or extracurricular keywords."}
+    You must output ONLY a valid JSON object.
+    Format: {"folder": "Category", "reasoning": "A short explanation of why."}
+    """
 
-    # Priority 4: Urgent / Critical Senders & Keywords
-    urgent_senders = ["boss", "ceo", "cfo", "vp", "security", "alert", "aws", "it-support", "compliance", "board"]
-    urgent_keywords = ["urgent", "critical", "asap", "action required", "outage"]
-    
-    if any(k in sender_lower for k in urgent_senders) or any(k in subject_lower for k in urgent_keywords):
-        # Edge case: The boss might just be sending a casual email
-        if "lunch" in body_lower or "casual" in subject_lower:
-            return {"folder": "Social", "reasoning": "Casual topic from leadership."}
-        return {"folder": "Urgent", "reasoning": "High-priority sender or urgent keywords."}
+    user_prompt = f"""
+    Analyze this email:
+    Sender: {sender}
+    Subject: {subject}
+    Body: {body}
+    VIP Status: {is_vip}
+    """
 
-    # Priority 5: Spam/Marketing Keywords in Body or Subject
-    spam_keywords = ["offer", "unsubscribe", "promo", "free trial", "click here", "buy now", "newsletter"]
-    if any(k in body_lower or k in subject_lower for k in spam_keywords):
-        return {"folder": "Spam", "reasoning": "Marketing or spam keywords found in text."}
-
-    # Priority 6: Default fallback
-    return {"folder": "Work", "reasoning": "Standard workplace mail."}
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            response = client_ai.chat.completions.create(
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt}
+                ],
+                model="llama-3.3-70b-versatile",
+                response_format={"type": "json_object"}, 
+                temperature=0.0
+            )
+            return json.loads(response.choices[0].message.content)
+            
+        except Exception as e:
+            error_message = str(e)
+            if "429" in error_message:
+                wait_time = 5 * (attempt + 1)
+                print(f"   [!] Rate limit hit. Cooling down for {wait_time} seconds before retrying...")
+                time.sleep(wait_time)
+            else:
+                return {"folder": "Work", "reasoning": f"LLM Error: {error_message}"}
+                
+    return {"folder": "Work", "reasoning": "LLM Error: Failed after multiple retries due to rate limits."}
 
 if __name__ == "__main__":
     run_triage()
